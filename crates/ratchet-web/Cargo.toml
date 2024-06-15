@@ -60,6 +60,7 @@ features = [
   'Cache',
   'CacheStorage',
   'IdbKeyRange',
+  'Performance'
 ]
 workspace = true
 

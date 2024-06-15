@@ -1,4 +1,6 @@
 use crate::db::*;
+use futures::stream::{self, TryStreamExt};
+use futures::StreamExt;
 use ratchet_hub::{Api, ApiBuilder, RepoType};
 use ratchet_loader::gguf::gguf::{self, Header, TensorInfo};
 use ratchet_models::moondream::{self, Moondream};
@@ -215,6 +217,10 @@ impl Model {
         model_key: ModelKey,
         progress: &js_sys::Function,
     ) -> Result<(), JsValue> {
+        let window = web_sys::window().expect("should have a window in this context");
+        let performance = window
+            .performance()
+            .expect("performance should be available");
         let model_id = model_key.model_id();
         let data_offset = header.tensor_data_offset;
         let content_len = header
@@ -226,37 +232,42 @@ impl Model {
             header.tensor_infos.clone().into_iter().collect();
         tensor_infos.sort_by(|(_, a), (_, b)| b.size_in_bytes().cmp(&a.size_in_bytes()));
 
-        let chunks = Self::chunk_tensor_infos(&tensor_infos, 4);
+        let tensor_stream = futures::stream::iter(tensor_infos);
 
         let mut total_progress = 0.0;
+        let start = performance.now();
 
-        for chunk in chunks {
-            let futures = chunk.into_iter().map(|(name, ti)| {
-                let range = ti.byte_range(data_offset);
+        tensor_stream
+            .map(|(name, info): (String, TensorInfo)| {
                 let model_id = model_id.clone();
+                let model_key = model_key.clone();
                 async move {
+                    let range = info.byte_range(data_offset);
                     let bytes = model_repo
                         .fetch_range(&model_id, range.start, range.end)
-                        .await?;
-                    Ok((name, bytes))
+                        .await
+                        .unwrap();
+                    let length = bytes.length();
+                    let record =
+                        TensorRecord::new(name.clone().to_string(), model_key.clone(), bytes);
+                    db.put_tensor(record).await.map_err(|e| {
+                        let e: JsError = e.into();
+                        Into::<JsValue>::into(e)
+                    });
+                    length
                 }
-            });
-
-            let results: Vec<Result<_, JsValue>> = futures::future::join_all(futures).await;
-
-            for result in results {
-                let (name, bytes) = result?;
-                let req_progress = (bytes.length() as f64) / (content_len as f64) * 100.0;
+            })
+            .buffer_unordered(6)
+            .map(|num_bytes| {
+                let req_progress = (num_bytes as f64) / (content_len as f64) * 100.0;
                 total_progress += req_progress;
                 let _ = progress.call1(&JsValue::NULL, &total_progress.into());
+            })
+            .collect::<()>()
+            .await;
 
-                let record = TensorRecord::new(name.to_string(), model_key.clone(), bytes);
-                db.put_tensor(record).await.map_err(|e| {
-                    let e: JsError = e.into();
-                    Into::<JsValue>::into(e)
-                })?;
-            }
-        }
+        let end = performance.now();
+        log::warn!("Model downloaded in {:?}ms", end - start);
         Ok(())
     }
 
